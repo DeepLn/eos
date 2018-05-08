@@ -554,6 +554,42 @@ authority parse_json_authority_or_key(const std::string& authorityJsonOrFile) {
    }
 }
 
+asset to_asset( const string& code, const string& s ) {
+   static map<eosio::chain::symbol_code, eosio::chain::symbol> cache;
+   auto a = asset::from_string( s );
+   eosio::chain::symbol_code sym = a.sym.to_symbol_code();
+   auto it = cache.find( sym );
+   auto sym_str = a.symbol_name();
+   if ( it == cache.end() ) {
+      auto json = call(get_currency_stats_func, fc::mutable_variant_object("json", false)
+                       ("code", code)
+                       ("symbol", sym_str)
+      );
+      auto obj = json.get_object();
+      auto obj_it = obj.find( sym_str );
+      if (obj_it != obj.end()) {
+         auto result = obj_it->value().as<eosio::chain_apis::read_only::get_currency_stats_result>();
+         auto p = cache.insert(make_pair( sym, result.max_supply.sym ));
+         it = p.first;
+      } else {
+         FC_THROW("Symbol ${s} is not supported by token contract ${c}", ("s", sym_str)("c", code));
+      }
+   }
+   auto expected_symbol = it->second;
+   if ( a.decimals() < expected_symbol.decimals() ) {
+      auto factor = expected_symbol.precision() / a.precision();
+      auto a_old = a;
+      a = asset( a.amount * factor, expected_symbol );
+   } else if ( a.decimals() > expected_symbol.decimals() ) {
+      FC_THROW("Too many decimal digits in ${a}, only ${d} supported", ("a", a)("d", expected_symbol.decimals()));
+   } // else precision matches
+   return a;
+}
+
+inline asset to_asset( const string& s ) {
+   return to_asset( "eosio.token", s );
+}
+
 struct set_account_permission_subcommand {
    string accountStr;
    string permissionStr;
@@ -752,9 +788,9 @@ struct create_account_subcommand {
             } EOS_RETHROW_EXCEPTIONS(public_key_type_exception, "Invalid active public key: ${public_key}", ("public_key", active_key_str));
             auto create = create_newaccount(creator, account_name, owner_key, active_key);
             if (!simple) {
-               action buyram = !buy_ram_eos.empty() ? create_buyram(creator, account_name, asset::from_string(buy_ram_eos))
+               action buyram = !buy_ram_eos.empty() ? create_buyram(creator, account_name, to_asset(buy_ram_eos))
                   : create_buyrambytes(creator, account_name, buy_ram_bytes_in_kbytes * 1024);
-               action delegate = create_delegate( creator, account_name, asset::from_string(stake_net), asset::from_string(stake_cpu) );
+               action delegate = create_delegate( creator, account_name, to_asset(stake_net), to_asset(stake_cpu) );
                send_actions( { create, buyram, delegate } );
             } else {
                send_actions( { create } );
@@ -823,6 +859,59 @@ struct vote_producers_subcommand {
    }
 };
 
+struct list_producers_subcommand {
+   bool print_json = false;
+   bool sort_names = false;
+
+   list_producers_subcommand(CLI::App* actionRoot) {
+      auto list_producers = actionRoot->add_subcommand("listproducers", localized("List producers"));
+      list_producers->add_flag("--json,-j", print_json, localized("Output in JSON format") );
+      list_producers->add_flag("--sort-account-names,-n", sort_names, localized("Sort by account names (default order is by votes)") );
+      list_producers->set_callback([this] {
+            auto result = call(get_table_func, fc::mutable_variant_object("json", true)
+                               ("code", name(config::system_account_name).to_string())
+                               ("scope", name(config::system_account_name).to_string())
+                               ("table", "producers")
+            );
+
+            if ( !print_json ) {
+               auto res = result.as<eosio::chain_apis::read_only::get_table_rows_result>();
+               std::vector<std::tuple<std::string, std::string, std::string, std::string>> v;
+               for ( auto& row : res.rows ) {
+                  auto& r = row.get_object();
+                  v.emplace_back( r["owner"].as_string(), r["total_votes"].as_string(), r["producer_key"].as_string(), r["url"].as_string() );
+
+               }
+               if ( !v.empty() ) {
+                  if ( sort_names ) {
+                     std::sort( v.begin(), v.end(), [](auto a, auto b) { return std::get<0>(a) < std::get<0>(b); } );
+                  } else {
+                     std::sort( v.begin(), v.end(), [](auto a, auto b) {
+                           return std::get<1>(a) < std::get<1>(b) || (std::get<1>(a) == std::get<1>(b) && std::get<0>(a) < std::get<0>(b)); }
+                     );
+                  }
+
+                  std::cout << std::left << std::setw(14) << "Producer" << std::setw(55) << "Producer key"
+                            << std::setw(50) << "Url" << "Total votes" << std::endl;
+                  for ( auto& x : v ) {
+                     std::cout << std::left << std::setw(14) << std::get<0>(x) << std::setw(55) << std::get<2>(x)
+                               << std::setw(50) << std::get<3>(x) << std::get<1>(x) << std::endl;
+                  }
+               } else {
+                  std::cout << "No producers found" << std::endl;
+               }
+            } else {
+               if ( sort_names ) {
+                  FC_THROW("Sorting producers is not supported for JSON format");
+               }
+               std::cout << fc::json::to_pretty_string(result)
+                         << std::endl;
+            }
+         }
+      );
+   }
+};
+
 struct delegate_bandwidth_subcommand {
    string from_str;
    string receiver_str;
@@ -842,8 +931,8 @@ struct delegate_bandwidth_subcommand {
          fc::variant act_payload = fc::mutable_variant_object()
                   ("from", from_str)
                   ("receiver", receiver_str)
-                  ("stake_net_quantity", stake_net_amount + " EOS")
-                  ("stake_cpu_quantity", stake_cpu_amount + " EOS");
+                  ("stake_net_quantity", to_asset(stake_net_amount))
+                  ("stake_cpu_quantity", to_asset(stake_cpu_amount));
                   wdump((act_payload));
          send_actions({create_action({permission_level{from_str,config::active_name}}, config::system_account_name, N(delegatebw), act_payload)});
       });
@@ -869,8 +958,8 @@ struct undelegate_bandwidth_subcommand {
          fc::variant act_payload = fc::mutable_variant_object()
                   ("from", from_str)
                   ("receiver", receiver_str)
-                  ("unstake_net_quantity", unstake_net_amount + " EOS")
-                  ("unstake_cpu_quantity", unstake_cpu_amount + " EOS");
+                  ("unstake_net_quantity", to_asset(unstake_net_amount))
+                  ("unstake_cpu_quantity", to_asset(unstake_cpu_amount));
          send_actions({create_action({permission_level{from_str,config::active_name}}, config::system_account_name, N(undelegatebw), act_payload)});
       });
    }
@@ -891,7 +980,7 @@ struct buyram_subcommand {
             fc::variant act_payload = fc::mutable_variant_object()
                ("payer", from_str)
                ("receiver", receiver_str)
-               ("quant", asset::from_string(amount));
+               ("quant", to_asset(amount));
             send_actions({create_action({permission_level{from_str,config::active_name}}, config::system_account_name, N(buyram), act_payload)});
          });
    }
@@ -1084,7 +1173,7 @@ void get_account( const string& accountName, bool json_format ) {
       std::cout << "net bandwidth:" << std::endl;
       if ( res.total_resources.is_object() && res.delegated_bandwidth.is_object() ) {
          asset net_own( stoll( res.delegated_bandwidth.get_object()["net_weight"].as_string() ) );
-         auto net_others = asset::from_string(res.total_resources.get_object()["net_weight"].as_string()) - net_own;
+         auto net_others = to_asset(res.total_resources.get_object()["net_weight"].as_string()) - net_own;
          std::cout << indent << "staked:" << std::setw(20) << net_own
                    << std::string(11, ' ') << "(total stake delegated from account to self)" << std::endl
                    << indent << "delegated:" << std::setw(17) << net_others
@@ -1102,7 +1191,7 @@ void get_account( const string& accountName, bool json_format ) {
       std::cout << "cpu bandwidth:" << std::endl;
       if ( res.total_resources.is_object() && res.delegated_bandwidth.is_object() ) {
          asset cpu_own( stoll( res.delegated_bandwidth.get_object()["cpu_weight"].as_string() ) );
-         auto cpu_others = asset::from_string(res.total_resources.get_object()["cpu_weight"].as_string()) - cpu_own;
+         auto cpu_others = to_asset(res.total_resources.get_object()["cpu_weight"].as_string()) - cpu_own;
          std::cout << indent << "staked:" << std::setw(20) << cpu_own
                    << std::string(11, ' ') << "(total stake delegated from account to self)" << std::endl
                    << indent << "delegated:" << std::setw(17) << cpu_others
@@ -1610,7 +1699,7 @@ int main( int argc, char** argv ) {
          tx_force_unique = false;
       }
 
-      send_actions({create_transfer(con,sender, recipient, asset::from_string(amount), memo)});
+      send_actions({create_transfer(con,sender, recipient, to_asset(amount), memo)});
    });
 
    // Net subcommand
@@ -2116,6 +2205,8 @@ int main( int argc, char** argv ) {
    voteProducer->require_subcommand();
    auto voteProxy = vote_producer_proxy_subcommand(voteProducer);
    auto voteProducers = vote_producers_subcommand(voteProducer);
+
+   auto listProducers = list_producers_subcommand(system);
 
    auto delegateBandWidth = delegate_bandwidth_subcommand(system);
    auto undelegateBandWidth = undelegate_bandwidth_subcommand(system);
